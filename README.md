@@ -1,10 +1,8 @@
-# LAMMPS pair style for NequIP
+# LAMMPS pair style for PHIN-atomic
 
-This pair style allows you to use NequIP models from the [`nequip`](https://github.com/mir-group/nequip) framework in LAMMPS simulations. For more details on NequIP and the Python code, please visit the [`nequip`](https://github.com/mir-group/nequip) repository.
+This pair style allows you to use models generated from the PHIN-atomic active learning framework in LAMMPS simulations. For more details on the PHIN-atomic active learning method .
 
-*Please Note: MPI is not supported due to the message-passing nature of the network. For MPI support with large numbers of atoms, please consider our [Allegro model](https://github.com/mir-group/allegro) and corresponding [`pair_allegro`](https://github.com/mir-group/pair_allegro) LAMMPS plugin.*
-
-`pair_nequip` authors: **Anders Johansson**, Albert Musaelian, Lixin Sun.
+We acknowledge the original developers of `pair_nequip` **Anders Johansson**, Albert Musaelian, Lixin Sun from which this package is based on
 
 ## Pre-requisites
 
