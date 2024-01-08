@@ -13,12 +13,12 @@
 
 #ifdef PAIR_CLASS
 
-PairStyle(nequip,PairNEQUIP)
+PairStyle(phin,PairPHIN)
 
 #else
 
-#ifndef LMP_PAIR_NEQUIP_H
-#define LMP_PAIR_NEQUIP_H
+#ifndef LMP_PAIR_PHIN_H
+#define LMP_PAIR_PHIN_H
 
 #include "pair.h"
 
@@ -26,22 +26,28 @@ PairStyle(nequip,PairNEQUIP)
 
 namespace LAMMPS_NS {
 
-class PairNEQUIP : public Pair {
+class PairPHIN : public Pair {
  public:
-  PairNEQUIP(class LAMMPS *);
-  virtual ~PairNEQUIP();
-  virtual void compute(int, int);
-  void settings(int, char **);
-  virtual void coeff(int, char **);
-  virtual double init_one(int, int);
-  virtual void init_style();
+  PairPHIN(class LAMMPS *);
+  virtual ~PairPHIN();
+  virtual void compute(int, int) override;
+  void settings(int, char **) override;
+  virtual void coeff(int, char **) override;
+  virtual double init_one(int, int) override;
+  virtual void init_style() override;
   void allocate();
+   //   void post_run();
 
   double cutoff;
+  double *uncertainties;
+  double tlimit();
   torch::jit::Module model;
   torch::Device device = torch::kCPU;
-
+  void *extract_peratom(const char *, int &) override;
+  double value, tratio;
+  
  protected:
+  int nmax;    // allocated size of per-atom arrays
   int * type_mapper;
   int debug_mode = 0;
 

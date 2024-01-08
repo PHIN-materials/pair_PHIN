@@ -15,7 +15,7 @@
    Contributing author: Anders Johansson (Harvard)
 ------------------------------------------------------------------------- */
 
-#include <pair_nequip.h>
+#include <pair_phin.h>
 #include "atom.h"
 #include "comm.h"
 #include "domain.h"
@@ -27,6 +27,8 @@
 #include "neighbor.h"
 #include "potential_file_reader.h"
 #include "tokenizer.h"
+#include "timer.h"
+#include "update.h"
 
 #include <cmath>
 #include <cstring>
@@ -62,9 +64,12 @@
 
 using namespace LAMMPS_NS;
 
-PairNEQUIP::PairNEQUIP(LAMMPS *lmp) : Pair(lmp) {
+PairPHIN::PairPHIN(LAMMPS *lmp) : Pair(lmp) {
   restartinfo = 0;
   manybody_flag = 1;
+  
+  nmax = 0;
+  uncertainties = nullptr;
 
   if(torch::cuda::is_available()){
     device = torch::kCUDA;
@@ -72,15 +77,19 @@ PairNEQUIP::PairNEQUIP(LAMMPS *lmp) : Pair(lmp) {
   else {
     device = torch::kCPU;
   }
-  std::cout << "NEQUIP is using device " << device << "\n";
+  std::cout << "PHIN is using device " << device << "\n";
 
-  if(const char* env_p = std::getenv("NEQUIP_DEBUG")){
-    std::cout << "PairNEQUIP is in DEBUG mode, since NEQUIP_DEBUG is in env\n";
+  if(const char* env_p = std::getenv("PHIN_DEBUG")){
+    std::cout << "PairPHIN is in DEBUG mode, since PHIN_DEBUG is in env\n";
     debug_mode = 1;
   }
 }
 
-PairNEQUIP::~PairNEQUIP(){
+enum{TLIMIT};
+
+PairPHIN::~PairPHIN(){
+
+  memory->destroy(uncertainties);
   if (allocated) {
     memory->destroy(setflag);
     memory->destroy(cutsq);
@@ -88,32 +97,35 @@ PairNEQUIP::~PairNEQUIP(){
   }
 }
 
-void PairNEQUIP::init_style(){
+void PairPHIN::init_style(){
   if (atom->tag_enable == 0)
-    error->all(FLERR,"Pair style NEQUIP requires atom IDs");
+    error->all(FLERR,"Pair style PHIN requires atom IDs");
 
   // need a full neighbor list
-  int irequest = neighbor->request(this,instance_me);
-  neighbor->requests[irequest]->half = 0;
-  neighbor->requests[irequest]->full = 1;
+  // int irequest = neighbor->request(this,instance_me);
+  neighbor->add_request(this, NeighConst::REQ_FULL);
+  // This one might be needed
+  // neighbor->add_request(this, NeighConst::REQ_FULL|NeighConst::REQ_GHOST);
+  // neighbor->requests[irequest]->half = 0;
+  // neighbor->requests[irequest]->full = 1;
 
-  // TODO: probably also
-  neighbor->requests[irequest]->ghost = 0;
+  // // TODO: probably also
+  // neighbor->requests[irequest]->ghost = 0;
 
   // TODO: I think Newton should be off, enforce this.
   // The network should just directly compute the total forces
   // on the "real" atoms, with no need for reverse "communication".
   // May not matter, since f[j] will be 0 for the ghost atoms anyways.
   if (force->newton_pair == 1)
-    error->all(FLERR,"Pair style NEQUIP requires newton pair off");
+    error->all(FLERR,"Pair style PHIN requires newton pair off");
 }
 
-double PairNEQUIP::init_one(int i, int j)
+double PairPHIN::init_one(int i, int j)
 {
   return cutoff;
 }
 
-void PairNEQUIP::allocate()
+void PairPHIN::allocate()
 {
   allocated = 1;
   int n = atom->ntypes;
@@ -124,13 +136,13 @@ void PairNEQUIP::allocate()
 
 }
 
-void PairNEQUIP::settings(int narg, char ** /*arg*/) {
+void PairPHIN::settings(int narg, char ** /*arg*/) {
   // "flare" should be the only word after "pair_style" in the input file.
   if (narg > 0)
     error->all(FLERR, "Illegal pair_style command");
 }
 
-void PairNEQUIP::coeff(int narg, char **arg) {
+void PairPHIN::coeff(int narg, char **arg) {
 
   if (!allocated)
     allocate();
@@ -154,7 +166,7 @@ void PairNEQUIP::coeff(int narg, char **arg) {
   for (int i = 1; i <= ntypes; i++){
       elements[i] = new char [strlen(arg[i+2])+1];
       strcpy(elements[i], arg[i+2]);
-      if (screen) fprintf(screen, "NequIP Coeff: type %d is element %s\n", i, elements[i]);
+      if (screen) fprintf(screen, "PHIN Coeff: type %d is element %s\n", i, elements[i]);
   }
 
   // Initiate type mapper
@@ -166,7 +178,7 @@ void PairNEQUIP::coeff(int narg, char **arg) {
 
   std::unordered_map<std::string, std::string> metadata = {
     {"config", ""},
-    {"nequip_version", ""},
+    {"phin_version", ""},
     {"r_max", ""},
     {"n_species", ""},
     {"type_names", ""},
@@ -176,11 +188,6 @@ void PairNEQUIP::coeff(int narg, char **arg) {
   };
   model = torch::jit::load(std::string(arg[2]), device, metadata);
   model.eval();
-
-  // Check if model is a NequIP model
-  if (metadata["nequip_version"].empty()) {
-    error->all(FLERR, "The indicated TorchScript file does not appear to be a deployed NequIP model; did you forget to run `nequip-deploy`?");
-  }
 
   // If the model is not already frozen, we should freeze it:
   // This is the check used by PyTorch: https://github.com/pytorch/pytorch/blob/master/torch/csrc/jit/api/module.cpp#L476
@@ -246,10 +253,11 @@ void PairNEQUIP::coeff(int narg, char **arg) {
   at::globalContext().setAllowTF32CuBLAS(allow_tf32);
   at::globalContext().setAllowTF32CuDNN(allow_tf32);
 
-  // std::cout << "Information from model: " << metadata.size() << " key-value pairs\n";
-  // for( const auto& n : metadata ) {
-  //   std::cout << "Key:[" << n.first << "] Value:[" << n.second << "]\n";
-  // }
+  
+  std::cout << "Information from model: " << metadata.size() << " key-value pairs\n";
+  for( const auto& n : metadata ) {
+    std::cout << "Key:[" << n.first << "] Value:[" << n.second << "]\n";
+  }
 
   cutoff = std::stod(metadata["r_max"]);
 
@@ -281,10 +289,16 @@ void PairNEQUIP::coeff(int narg, char **arg) {
 }
 
 // Force and energy computation
-void PairNEQUIP::compute(int eflag, int vflag){
+void PairPHIN::compute(int eflag, int vflag){
   ev_init(eflag, vflag);
 
   // Get info from lammps:
+
+  if (atom->nmax > nmax) {
+    memory->destroy(uncertainties);
+    nmax = atom->nmax;
+    memory->create(uncertainties,nmax,"pair:rho");
+  }
 
   // Atom positions, including ghost atoms
   double **x = atom->x;
@@ -301,7 +315,7 @@ void PairNEQUIP::compute(int eflag, int vflag){
   int newton_pair = force->newton_pair;
   // Should probably be off.
   if (newton_pair==1)
-    error->all(FLERR,"Pair style NEQUIP requires 'newton off'");
+    error->all(FLERR,"Pair style PHIN requires 'newton off'");
 
   // Number of local/real atoms
   int inum = list->inum;
@@ -320,15 +334,28 @@ void PairNEQUIP::compute(int eflag, int vflag){
   // Total number of bonds (sum of number of neighbors)
   int nedges = std::accumulate(numneigh, numneigh+ntotal, 0);
 
+  // std::cout << "Number of Edges: " << nedges  << "\n";
+  if(nedges==0) {
+    std::cout << "No Edges Detected\n";
+    // error->all(FLERR,"No Edges Detected");
+    if (comm->me == 0) error->message(FLERR,"No Edges Detected");
+    timer->force_timeout();
+  }
+
   torch::Tensor pos_tensor = torch::zeros({nlocal, 3});
   torch::Tensor tag2type_tensor = torch::zeros({nlocal}, torch::TensorOptions().dtype(torch::kInt64));
+  // torch::Tensor tag2type_tensor = torch::zeros({nlocal}, torch::TensorOptions().dtype(torch::int64_t));
+  // auto data = T.data<int64_t>();
   torch::Tensor periodic_shift_tensor = torch::zeros({3});
   torch::Tensor cell_tensor = torch::zeros({3,3});
 
   auto pos = pos_tensor.accessor<float, 2>();
-  long edges[2*nedges];
+  // long edges[2*nedges];
+  int64_t edges[2*nedges];
   float edge_cell_shifts[3*nedges];
-  auto tag2type = tag2type_tensor.accessor<long, 1>();
+  // auto tag2type = tag2type_tensor.accessor<long, 1>();
+  auto tag2type = tag2type_tensor.accessor<int64_t, 1>();
+  // auto data = T.data<int64_t>();
   auto periodic_shift = periodic_shift_tensor.accessor<float, 1>();
   auto cell = cell_tensor.accessor<float,2>();
 
@@ -375,7 +402,7 @@ void PairNEQUIP::compute(int eflag, int vflag){
   // ii follows the order of the neighbor lists,
   // i follows the order of x, f, etc.
   int edge_counter = 0;
-  if (debug_mode) printf("NEQUIP edges: i j xi[:] xj[:] cell_shift[:] rij\n");
+  if (debug_mode) printf("PHIN edges: i j xi[:] xj[:] cell_shift[:] rij\n");
   for(int ii = 0; ii < nlocal; ii++){
     int i = ilist[ii];
     int itag = tag[i];
@@ -422,16 +449,28 @@ void PairNEQUIP::compute(int eflag, int vflag){
       }
     }
   }
-  if (debug_mode) printf("end NEQUIP edges\n");
+  if (debug_mode) printf("end PHIN edges\n");
 
-  // shorten the list before sending to nequip
+  std::string message = fmt::format("Number of edges equal to {}",edge_counter);
+
+  // Could improve this to make it a soft error
+  // std::cout << "Number of Edges: " << edge_counter  << "\n";
+  if(edge_counter==0) {
+    error->all(FLERR,"No Edges Detected");
+    // if (comm->me == 0) error->message(FLERR,"No Edges Detected");
+    // timer->force_timeout();
+  }
+
+  // shorten the list before sending to phin
   torch::Tensor edges_tensor = torch::zeros({2,edge_counter}, torch::TensorOptions().dtype(torch::kInt64));
   torch::Tensor edge_cell_shifts_tensor = torch::zeros({edge_counter,3});
-  auto new_edges = edges_tensor.accessor<long, 2>();
+  // auto new_edges = edges_tensor.accessor<long, 2>();
+  auto new_edges = edges_tensor.accessor<int64_t, 2>();
   auto new_edge_cell_shifts = edge_cell_shifts_tensor.accessor<float, 2>();
   for (int i=0; i<edge_counter; i++){
 
-      long *e=&edges[i*2];
+      // long *e=&edges[i*2];
+      int64_t *e=&edges[i*2];
       new_edges[0][i] = e[0];
       new_edges[1][i] = e[1];
 
@@ -451,7 +490,7 @@ void PairNEQUIP::compute(int eflag, int vflag){
   std::vector<torch::IValue> input_vector(1, input);
 
   if(debug_mode){
-    std::cout << "NequIP model input:\n";
+    std::cout << "PHIN model input:\n";
     std::cout << "pos:\n" << pos_tensor << "\n";
     std::cout << "edge_index:\n" << edges_tensor << "\n";
     std::cout << "edge_cell_shifts:\n" << edge_cell_shifts_tensor << "\n";
@@ -473,12 +512,31 @@ void PairNEQUIP::compute(int eflag, int vflag){
   torch::Tensor atomic_energy_tensor = output.at("atomic_energy").toTensor().cpu();
   auto atomic_energies = atomic_energy_tensor.accessor<float, 2>();
   float atomic_energy_sum = atomic_energy_tensor.sum().data_ptr<float>()[0];
+  torch::Tensor uncertainties_tensor = output.at("uncertainties").toTensor().cpu();
+  auto uncertainties_itag = uncertainties_tensor.accessor<float, 2>();
+
+  if(vflag){
+    torch::Tensor v_tensor = output.at("virial").toTensor().cpu();
+    auto v = v_tensor.accessor<float, 3>();
+    // Convert from 3x3 symmetric tensor format, which NequIP outputs, to the flattened form LAMMPS expects
+    // First [0] index on v is batch
+    virial[0] = v[0][0][0];
+    virial[1] = v[0][1][1];
+    virial[2] = v[0][2][2];
+    virial[3] = v[0][0][1];
+    virial[4] = v[0][0][2];
+    virial[5] = v[0][1][2];
+  }
+  if(vflag_atom) {
+    error->all(FLERR,"Pair style NEQUIP does not support per-atom virial");
+  }
 
   if(debug_mode){
-    std::cout << "NequIP model output:\n";
+    std::cout << "PHIN model output:\n";
     std::cout << "forces: " << forces_tensor << "\n";
     std::cout << "total_energy: " << total_energy_tensor << "\n";
     std::cout << "atomic_energy: " << atomic_energy_tensor << "\n";
+    if(vflag) std::cout << "virial: " << output.at("virial").toTensor().cpu() << std::endl;
   }
 
   //std::cout << "atomic energy sum: " << atomic_energy_sum << std::endl;
@@ -493,6 +551,7 @@ void PairNEQUIP::compute(int eflag, int vflag){
     f[i][1] = forces[itag][1];
     f[i][2] = forces[itag][2];
     if (eflag_atom) eatom[i] = atomic_energies[itag][0];
+    uncertainties[i] = uncertainties_itag[itag][0];
     //printf("%d %d %g %g %g %g %g %g\n", i, type[i], pos[itag][0], pos[itag][1], pos[itag][2], f[i][0], f[i][1], f[i][2]);
   }
 
@@ -509,4 +568,29 @@ void PairNEQUIP::compute(int eflag, int vflag){
     c10::cuda::CUDACachingAllocator::emptyCache();
   }
   */
+}
+
+void *PairPHIN::extract_peratom(const char *str, int &ncol)
+{
+  if (strcmp(str,"uncertainties") == 0) {
+    ncol = 0;
+    return (void *) uncertainties;
+  }
+
+  return nullptr;
+}
+
+double PairPHIN::tlimit()
+{
+  double cpu = timer->elapsed(Timer::TOTAL);
+  MPI_Bcast(&cpu,1,MPI_DOUBLE,0,world);
+
+  if (cpu < value) {
+    bigint elapsed = update->ntimestep - update->firststep;
+    bigint final = update->firststep +
+      static_cast<bigint> (tratio*value/cpu * elapsed);
+    tratio = 1.0;
+  }
+
+  return cpu;
 }

@@ -36,8 +36,8 @@ then
 fi
 
 # Check and produce nice message
-if [ ! -f pair_nequip.cpp ]; then
-    echo "Please run `patch_lammps.sh` from the `pair_nequip` root directory."
+if [ ! -f pair_phin.cpp ]; then
+    echo "Please run `patch_lammps.sh` from the `pair_phin` root directory."
     exit 1
 fi
 
